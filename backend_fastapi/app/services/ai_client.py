@@ -16,9 +16,10 @@ class AIClient:
         """
         Sliding Window Task: Every 5 seconds, collects the 10-second window
         from RingBuffer for all active devices and sends to AI Service via HTTPX.
+        Supports both v2 (new) and v1 (fallback) based on settings.AI_VERSION.
         """
         self.is_running = True
-        logger.info("AI Sliding Window Client Worker started.")
+        logger.info(f"AI Sliding Window Client Worker started (Target: {settings.AI_VERSION.upper()}).")
         
         async with httpx.AsyncClient(timeout=10.0) as client:
             while self.is_running:
@@ -27,28 +28,85 @@ class AIClient:
                     active_devices = list(buffer_manager.ring_buffers.keys())
                     
                     for device_id in active_devices:
-                        window_data = buffer_manager.get_sliding_window(device_id)
-                        if not window_data:
-                            continue
-                        
-                        # Only send if we have meaningful data
-                        if len(window_data["vitals"]["spo2"]) < 3 and len(window_data["ecg"]["samples"]) < 200:
-                            continue
-
-                        await self._send_to_ai_service(client, window_data)
+                        if settings.AI_VERSION.lower() == "v2":
+                            payload_v2 = buffer_manager.get_sliding_window_v2(device_id)
+                            if payload_v2:
+                                await self._send_to_ai_service_v2(client, device_id, payload_v2)
+                        else:
+                            window_data = buffer_manager.get_sliding_window(device_id)
+                            if not window_data:
+                                continue
+                            if len(window_data["vitals"]["spo2"]) < 3 and len(window_data["ecg"]["samples"]) < 200:
+                                continue
+                            await self._send_to_ai_service_v1(client, window_data)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
                     logger.error(f"Error in AI client sliding window worker: {e}", exc_info=True)
 
-    async def _send_to_ai_service(self, client: httpx.AsyncClient, window_data: dict):
+    async def _send_to_ai_service_v2(self, client: httpx.AsyncClient, device_id: str, payload: dict):
+        url = f"{settings.AI_SERVICE_URL}/api/v2/analyze"
+        try:
+            response = await client.post(url, json=payload)
+            if response.status_code == 200:
+                result = response.json()
+                context_status = result.get("context", {}).get("analysis_status")
+                fall_status = result.get("fall", {}).get("analysis_status")
+                afib_res = result.get("afib", {})
+                afib_detected = afib_res.get("afib_detected")
+
+                logger.info(f"AI v2 Result for {device_id}: Context={context_status}, Fall={fall_status}, AFib={afib_detected}")
+
+                # 1. Broadcast AI analysis result to WebSocket
+                await ws_manager.broadcast(device_id, {
+                    "event_type": "AI_RESULT",
+                    "data": result
+                })
+
+                # 2. Check for critical triggers from v2 modules
+                if context_status == "RESPIRATORY_RISK":
+                    await alert_router.route_alert({
+                        "device_id": device_id,
+                        "alert_type": "RESPIRATORY_RISK",
+                        "severity": "CRITICAL",
+                        "message": "Nguy cơ suy hô hấp cấp (SpO2 < 92% khi bất động)!"
+                    })
+                elif context_status == "SENSOR_LOOSE":
+                    await alert_router.route_alert({
+                        "device_id": device_id,
+                        "alert_type": "SENSOR_LOOSE",
+                        "severity": "NOISE",
+                        "message": "Nhiễu tín hiệu / Lỏng cảm biến SpO2 do chuyển động."
+                    })
+
+                if fall_status == "FALL_CONFIRMED":
+                    await alert_router.route_alert({
+                        "device_id": device_id,
+                        "alert_type": "FALL_CONFIRMED",
+                        "severity": "CRITICAL",
+                        "message": "Bệnh nhân ngã / Mất ý thức (Xác nhận đa biến)!"
+                    })
+
+                if afib_detected or (afib_res.get("afib_probability") or 0) >= 0.70:
+                    await alert_router.route_alert({
+                        "device_id": device_id,
+                        "alert_type": "AFIB_HIGH_RISK",
+                        "severity": "CRITICAL",
+                        "message": "Phát hiện bất thường điện tim (Rung nhĩ - AFib) - Khuyến nghị tầm soát nguy cơ đột quỵ!"
+                    })
+            else:
+                logger.warning(f"AI Service v2 returned {response.status_code}: {response.text}")
+        except Exception as e:
+            logger.warning(f"Failed to communicate with AI Service v2 at {url}: {e}")
+
+    async def _send_to_ai_service_v1(self, client: httpx.AsyncClient, window_data: dict):
         url = f"{settings.AI_SERVICE_URL}/api/v1/analyze"
         device_id = window_data["device_id"]
         try:
             response = await client.post(url, json=window_data)
             if response.status_code == 200:
                 result = response.json()
-                logger.info(f"AI Result for {device_id}: Context={result.get('context_status')}, Fall={result.get('fall_status')}, AFib={result.get('afib_detected')}")
+                logger.info(f"AI v1 Result for {device_id}: Context={result.get('context_status')}, Fall={result.get('fall_status')}, AFib={result.get('afib_detected')}")
                 
                 # 1. Broadcast AI analysis result to WebSocket
                 await ws_manager.broadcast(device_id, {
@@ -88,8 +146,8 @@ class AIClient:
                         "message": "Phát hiện bất thường điện tim (Rung nhĩ - AFib) - Khuyến nghị tầm soát nguy cơ đột quỵ!"
                     })
             else:
-                logger.warning(f"AI Service responded with status {response.status_code}: {response.text}")
+                logger.warning(f"AI Service v1 responded with status {response.status_code}: {response.text}")
         except Exception as e:
-            logger.warning(f"Failed to communicate with AI Service at {url}: {e}")
+            logger.warning(f"Failed to communicate with AI Service v1 at {url}: {e}")
 
 ai_client = AIClient()

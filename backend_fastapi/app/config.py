@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     MQTT_HOST: str = os.getenv("MQTT_HOST", "localhost")
     MQTT_PORT: int = int(os.getenv("MQTT_PORT", "1883"))
     AI_SERVICE_URL: str = os.getenv("AI_SERVICE_URL", "http://localhost:8001")
+    AI_VERSION: str = os.getenv("AI_VERSION", "v2")  # "v1" or "v2"
     APP_PORT: int = int(os.getenv("APP_PORT", "8000"))
 
     class Config:
